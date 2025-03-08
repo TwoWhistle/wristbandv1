@@ -1,21 +1,28 @@
+/***********************************************************
+ *  Example: wristbandv1.ino
+ *  - Collect ECG (analog pin) and PPG (MAX30102) data
+ *  - Collect SCD41 data (CO2, Temp, Humidity) every 5s
+ *  - Bundle raw samples into a single chunk + attach SCD41
+ *  - Send chunk to iOS for advanced processing
+ ***********************************************************/
+
 #include <Wire.h>
-#include "SparkFun_SCD4x_Arduino_Library.h"  // SCD41 Library
-#include "MAX30105.h"                        // MAX30102 Library
-#include "heartRate.h"                        // Heart Rate Algorithm
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "SparkFun_SCD4x_Arduino_Library.h"
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
 
+// ========== BLE DEFINITIONS ==========
 #define SERVICE_UUID "12345678-1234-1234-1234-123456789abc"
-#define EEG_CHARACTERISTIC "abcd5678-ab12-cd34-ef56-abcdef123456"
+#define DATA_CHARACTERISTIC_UUID "abcd5678-ab12-cd34-ef56-abcdef123456"
 
-BLECharacteristic eegCharacteristic(
-  EEG_CHARACTERISTIC,
-  BLECharacteristic::PROPERTY_NOTIFY);
+BLECharacteristic dataCharacteristic(DATA_CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_NOTIFY);
 
 bool deviceConnected = false;
-BLEAdvertising *pAdvertising;
+BLEAdvertising* pAdvertising;
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -28,167 +35,182 @@ class ServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-// Create sensor objects
-SCD4x scd41;           // CO2, Temperature, Humidity Sensor
-MAX30105 particleSensor;  // MAX30102 Heart Rate Sensor
+// ========== SENSOR DEFINITIONS & GLOBALS ==========
 
-// Heart rate calculation variables
-const byte RATE_SIZE = 4; // Number of readings for averaging BPM
-byte rates[RATE_SIZE];    // Array to store heart rate values
-byte rateSpot = 0;
-long lastBeat = 0;        // Time of last beat detection
-float beatsPerMinute;
-int beatAvg;
+// -- MAX30102 (PPG) --
+MAX30105 particleSensor;
 
+// -- SCD41 (CO2, Temp, Humidity) --
+SCD4x scd41;
+float latestCO2 = 0.0;
+float latestTemp = 0.0;
+float latestHumidity = 0.0;
+
+// We'll read SCD41 every 5 seconds
 unsigned long lastSCD41Read = 0;
+const unsigned long SCD41_INTERVAL_MS = 5000;
 
-const unsigned long nestedLoopDuration = 1000;  // Nested loop runs for 1 second
+// -- ECG & PPG Data Buffering --
+#define SAMPLING_FREQUENCY 100         // e.g., 100 Hz
+#define N_SAMPLES 100                  // e.g., 1-second chunk at 100 Hz
 
-float co2 = 0, temp = 0, humidity = 0;
+float ecgBuffer[N_SAMPLES];
+float ppgBuffer[N_SAMPLES];
+int sampleIndex = 0;
 
+unsigned long lastSampleTime = 0;
+unsigned long sampleInterval = 1000 / SAMPLING_FREQUENCY; // ms per sample
+
+// Helper function to send the big chunk in smaller pieces
+void sendInChunks(const String &fullStr, size_t maxChunkSize = 150) {
+  // If you're negotiating an MTU of ~185 bytes, you can set maxChunkSize=150 or 180.
+  // 150 is safe to account for overhead bytes.
+  if (!deviceConnected){
+    Serial.println("Device disconnected while sending in chunks");
+    return;
+  } 
+
+  size_t totalLen = fullStr.length();
+  size_t offset = 0;
+
+  while (offset < totalLen) {
+    size_t chunkLen = (totalLen - offset > maxChunkSize) ? maxChunkSize : (totalLen - offset);
+    String sub = fullStr.substring(offset, offset + chunkLen);
+
+    // Send this piece
+    dataCharacteristic.setValue((uint8_t*) sub.c_str(), sub.length());
+    dataCharacteristic.notify();
+
+    offset += chunkLen;
+
+    // A short delay helps ensure the BLE stack has time
+    // to process before sending the next piece
+    delay(20);
+  }
+}
 
 void setup() {
-    Serial.begin(115200);
-    Wire.begin();  // Initialize I2C communication
+  Serial.begin(115200);
+  Wire.begin();
 
-    // Initialize SCD41
-    if (!scd41.begin()) {
-        Serial.println("Failed to initialize SCD41! Check wiring.");
-    } else {
-        Serial.println("SCD41 initialized.");
-        scd41.startPeriodicMeasurement();
-    }
+  // ========== Initialize SCD41 ==========
+  if (!scd41.begin()) {
+    Serial.println("Failed to initialize SCD41! Check wiring.");
+  } else {
+    Serial.println("SCD41 initialized.");
+    scd41.startPeriodicMeasurement(); // Start measuring in periodic mode
+  }
 
-    // Initialize MAX30102
-    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {  // 400kHz I2C speed
-        Serial.println("MAX30102 was not found! Check wiring.");
-        while (1);  // Halt if sensor not found
-    }
-    
+  // ========== Initialize MAX30102 ==========
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found. Check wiring!");
+    while (1);
+  }
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x3F);
+  particleSensor.setPulseAmplitudeGreen(0);
 
-    // MAX30102 sensor setup
-    particleSensor.setup();  // Configures sensor with default settings
-    particleSensor.setPulseAmplitudeRed(0x3F);  //Turn Red LED to low to indicate sensor is running
-    particleSensor.setPulseAmplitudeGreen(0);   //Turn off Green LED
-
-    Serial.println("Initialized sensors.");
-
-  Serial.println("🚀 ESP32 BLE Setup Starting...");
-
-  BLEDevice::deinit(); // Ensures a clean restart of BLE
+  // ========== BLE SETUP ==========
+  BLEDevice::deinit();
   delay(100);
-
-  // ✅ Initialize BLE
   BLEDevice::init("ESP32_Health_Monitor");
+  BLEDevice::setMTU(185);
   BLEServer* pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
   BLEService* pService = pServer->createService(SERVICE_UUID);
-  if (pService == nullptr) {
-      Serial.println("❌ Failed to create BLE Service!");
-  } else {
-      Serial.println("✅ BLE Service Created Successfully");
-  }
+  pService->addCharacteristic(&dataCharacteristic);
 
-  pService->addCharacteristic(&eegCharacteristic);
-
-  // ✅ Add BLE2902 Descriptor for EEG
-  BLE2902* eegDescriptor = new BLE2902();
-  eegCharacteristic.addDescriptor(eegDescriptor);
-  eegDescriptor->setNotifications(true);
+  BLE2902* descriptor = new BLE2902();
+  dataCharacteristic.addDescriptor(descriptor);
+  descriptor->setNotifications(true);
 
   pService->start();
-  Serial.println("✅ BLE Service Started");
-
   pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
+  pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);  // Helps with iOS compatibility
   pAdvertising->start();
-  Serial.println("📡 BLE Advertising Started with Service UUID");
 
+  Serial.println("📡 BLE Advertising started");
 }
 
 void loop() {
-    
-    unsigned long nestedLoopStart = millis();
-        
-    // Run nested loop for 1 second without delay
-    while (millis() - nestedLoopStart < nestedLoopDuration) {
-    
-    // Read MAX30102 Heart Rate Data
-    long irValue = particleSensor.getIR();
+  unsigned long currentMillis = millis();
 
-    if (checkForBeat(irValue)) {
-        // Detected a beat
-        Serial.println("Heartbeat detected!");  
-        long delta = millis() - lastBeat;
-        Serial.print("Delta: "); Serial.println(delta);  // Debugging
+  // ========== 2) Sample ECG & PPG at 100 Hz ==========
+  if (currentMillis - lastSampleTime >= sampleInterval) {
+    lastSampleTime = currentMillis;
 
-        lastBeat = millis();
+    // Read raw ECG from analog pin
+    float ecgValue = analogRead(1);
 
-        beatsPerMinute = 60 / (delta / 1000.0);
+    // Read raw PPG IR from MAX30102
+    float irValue = particleSensor.getIR();
 
-        //averaging
-        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-            rates[rateSpot++] = (byte)beatsPerMinute;  // Store reading
-            rateSpot %= RATE_SIZE;  // Wrap variable
+    ecgBuffer[sampleIndex] = ecgValue;
+    ppgBuffer[sampleIndex] = irValue;
+    sampleIndex++;
 
-            // Average the readings
-            beatAvg = 0;
-            for (byte x = 0; x < RATE_SIZE; x++)
-                beatAvg += rates[x];
-            beatAvg /= RATE_SIZE;
-        }
-    }else{
-      Serial.println("no heartbeat detected");
+    // ========== 3) If we filled one chunk of samples, send it ==========
+    if (sampleIndex >= N_SAMPLES) {
+      // Create chunk
+      // Format (semicolon-separated sections):
+      // TIMESTAMP;
+      // ECG,ecg0,ecg1,...;
+      // PPG,ppg0,ppg1,...;
+      // SCD,co2,temp,hum
+      unsigned long timestamp = millis(); // or use RTC for real-time seconds
+
+      String chunk = String(timestamp);
+      chunk += ";ECG";
+      for (int i = 0; i < N_SAMPLES; i++) {
+        chunk += ",";
+        chunk += String(ecgBuffer[i], 0);
+      }
+      chunk += ";PPG";
+      for (int i = 0; i < N_SAMPLES; i++) {
+        chunk += ",";
+        chunk += String(ppgBuffer[i], 0);
+      }
+
+      if (scd41.readMeasurement()) {
+      latestCO2 = scd41.getCO2();          // in ppm
+      latestTemp = scd41.getTemperature(); // in °C
+      latestHumidity = scd41.getHumidity(); // in %
+      /*
+      Serial.print("SCD41 --> CO2: ");
+      Serial.print(latestCO2);
+      Serial.print(" ppm, Temp: ");
+      Serial.print(latestTemp);
+      Serial.print(" C, Hum: ");
+      Serial.print(latestHumidity);
+      Serial.println(" %");
+      */
+    } else {
+      Serial.println("Failed to read SCD41.");
     }
 
-    // Print Heart Rate Data
-    Serial.print("IR: "); Serial.print(irValue);
-    Serial.print(", BPM: "); Serial.print(beatsPerMinute);
-    Serial.print(", Avg BPM: "); Serial.print(beatAvg);
+      // Append SCD41 data
+      chunk += ";SCD," + String(latestCO2, 2) + "," + String(latestTemp, 2) + "," + String(latestHumidity, 2);
 
-    if (irValue < 50000) Serial.print(" (No Finger Detected)");
+      chunk += "*";
 
-    Serial.println();
+      Serial.println("======== SENDING DATA CHUNK ========");
+      Serial.println(chunk);
 
+      if (deviceConnected) {
+        dataCharacteristic.setValue(chunk.c_str());
+        dataCharacteristic.notify();
+      }
+
+      // Now send that big chunk in smaller pieces
+      if (deviceConnected) {
+        sendInChunks(chunk, 150);  // example: chunk size ~150 bytes per notification
+      }
+
+      // Reset for next chunk
+      sampleIndex = 0;
     }
-    
+  }
 
-    
-    // Read SCD41 (CO2, Temperature, Humidity)
-    if (millis() - lastSCD41Read >= 5000) { 
-        lastSCD41Read = millis();
-        if (scd41.readMeasurement()) {
-            co2 = scd41.getCO2();
-            temp = scd41.getTemperature();
-            humidity = scd41.getHumidity();
-        } else {
-            Serial.println("Failed to read SCD41.");
-        }
-    }
-
-    Serial.print("CO2: "); Serial.print(co2); Serial.print(" ppm, ");
-    Serial.print("Temp: "); Serial.print(temp, 2); Serial.print(" C, ");
-    Serial.print("Humidity: "); Serial.print(humidity, 2); Serial.println(" %");
-
-    //ecg
-    int ecgSignal = analogRead(1);
-    String ecgString = String(ecgSignal);
-    Serial.println("ECG: " + ecgString);
-
-    // **Combine all data into a single string**
-    String dataString = String(ecgSignal) + "," + 
-                        String(beatAvg) + "," + 
-                        String(co2) + "," +
-                        String(temp) + "," + 
-                        String(humidity);
-
-    Serial.println("BLE Data: " + dataString);
-
-    eegCharacteristic.setValue(dataString.c_str());
-    eegCharacteristic.notify();
-
-    delay(1000);  
 }

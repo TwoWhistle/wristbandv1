@@ -40,6 +40,10 @@ struct wristbandV1App: App {
                     .tabItem {
                         Label("Debug Log", systemImage: "terminal")
                     }
+                MetricsView(bleManager: bleManager)
+                        .tabItem {
+                            Label("Metrics", systemImage: "heart.text.square")
+                        }
             }
         }
         .modelContainer(sharedModelContainer)
